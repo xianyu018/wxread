@@ -7,6 +7,7 @@ import logging
 import hashlib
 import requests
 import urllib.parse
+import sys
 from push import push
 from config import data, headers, cookies, READ_NUM, PUSH_METHOD, book, chapter
 
@@ -20,6 +21,9 @@ COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread", "ql": True}
 READ_URL = "https://weread.qq.com/web/book/read"
 RENEW_URL = "https://weread.qq.com/web/login/renewal"
 FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
+
+# 连续失败次数上限，超过则退出（防止cookie过期后无限重试卡死）
+MAX_CONSECUTIVE_FAILURES = 10
 
 
 def encode_data(data):
@@ -77,9 +81,14 @@ logging.info(f"⏱️ 一共需要阅读 {READ_NUM} 次...")
 
 success_count = 0
 fail_count = 0
-max_retries = 3
+consecutive_failures = 0  # 连续失败计数
 
 while index <= READ_NUM:
+    # 连续失败过多，退出
+    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+        logging.error(f"💀 连续失败{consecutive_failures}次，Cookie可能已过期，终止运行。请更新WXREAD_CURL_BASH。")
+        break
+
     # 复制数据避免修改原数据
     current_data = data.copy()
     current_data.pop('s', None)
@@ -106,29 +115,42 @@ while index <= READ_NUM:
                 lastTime = thisTime
                 index += 1
                 success_count += 1
+                consecutive_failures = 0  # 成功则重置连续失败计数
                 time.sleep(30)
                 logging.info(f"✅ 阅读成功，阅读进度：{(index - 1) * 0.5} 分钟")
             else:
                 logging.warning("❌ 无synckey, 尝试修复...")
                 fix_no_synckey()
                 fail_count += 1
+                consecutive_failures += 1
                 time.sleep(5)
         else:
             logging.warning(f"❌ 响应异常: {resData}")
             # 尝试刷新cookie
             if refresh_cookie():
                 logging.info("🔄 Cookie已刷新，重试本次阅读")
+                consecutive_failures = 0
             else:
                 fail_count += 1
+                consecutive_failures += 1
                 time.sleep(5)
 
     except Exception as e:
         logging.error(f"❌ 请求失败: {e}")
         fail_count += 1
+        consecutive_failures += 1
         time.sleep(5)
 
 logging.info(f"🎉 阅读脚本已完成！成功: {success_count}, 失败: {fail_count}")
 
-if PUSH_METHOD not in (None, '') and success_count > 0:
+# 推送结果（无论成功失败都推送，方便知道运行状态）
+if PUSH_METHOD not in (None, ''):
     logging.info("⏱️ 开始推送...")
-    push(f"🎉 微信读书自动阅读完成！\n⏱️ 阅读时长：{success_count * 0.5}分钟。\n📊 成功: {success_count}次, 失败: {fail_count}次", PUSH_METHOD)
+    if success_count > 0:
+        push(f"🎉 微信读书自动阅读完成！\n⏱️ 阅读时长：{success_count * 0.5}分钟。\n📊 成功: {success_count}次, 失败: {fail_count}次", PUSH_METHOD)
+    elif consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+        push(f"❌ 微信读书刷时长失败！\n💀 连续失败{consecutive_failures}次，Cookie可能已过期。\n请重新抓取curl_bash并更新WXREAD_CURL_BASH。", PUSH_METHOD)
+
+# 如果连续失败导致退出，返回非零退出码
+if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+    sys.exit(1)
